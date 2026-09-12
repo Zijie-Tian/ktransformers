@@ -78,8 +78,9 @@ class TP_MOE_Common : public MoE_Interface {
 #define QK_K 256
 #endif
 
-    if (is_llamafile) {
-      // For Llamafile backend: use QK_K-aligned TP splitting
+    if (is_llamafile && tp_count > 1) {
+      // QK_K alignment applies when slicing intermediate_size across TP
+      // partitions. A single partition owns the full width and can alias mmap.
       if (config.intermediate_size % QK_K != 0) {
         printf("intermediate_size %d must be divisible by QK_K %d for Llamafile backend\n", config.intermediate_size,
                QK_K);
