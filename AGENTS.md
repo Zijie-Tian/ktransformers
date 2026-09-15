@@ -23,7 +23,134 @@ Rules:
 4. CMake is idempotent and uses no marker file inside the submodule (a marker would show up as untracked forever): `git apply --check`, else `git apply --reverse --check` meaning “already applied”.
 5. If `git apply --reverse --check` fails for those two patches, the submodule has **extra** local edits on top of the official series — stop and inspect; do not blindly discard them.
 
+## Jetson runbook: agx / edge1 / edge2 / edge3
+
+Inventory and deployed launcher paths were checked over SSH on **2026-09-15**. The successful generation dates below refer to saved end-to-end tests, **not a new inference run during this documentation update**.
+
+| SSH host | Hardware / system | CUDA used by `ktransformers` | Last successful full-model test |
+|---|---|---|---|
+| `agx` | AGX Orin, SM87; Ubuntu 22.04, L4T 36.3.0 | System `/usr/local/cuda-12.2` | 2026-09-12: Llama-3.1-8B-Instruct, FP16 / Triton, Paris and `5.` |
+| `edge1` | AGX Xavier, SM72; Ubuntu 20.04, L4T 35.6.4 | Private CUDA 12.2; system CUDA 11.4 preserved | 2026-09-13: Llama-3.2-1B-Instruct, FP16 / `torch_native`, Paris and five |
+| `edge2` | AGX Xavier, SM72; Ubuntu 20.04, L4T 35.6.4 | Same private CUDA profile | 2026-09-13: same two Llama-1B answers |
+| `edge3` | AGX Xavier, SM72; Ubuntu 20.04, L4T 35.6.4 | Same private CUDA profile | 2026-09-13: same two Llama-1B answers |
+
+These are **dense CUDA inference** results through `kt run` → SGLang-KT. They do not demonstrate CPU routed-expert offload, arbitrary model support, quantized inference, or multi-GPU/multi-host serving. Edge1 received additional experimental DeepSeek changes after its dense baseline; rerun the relevant smoke before accepting a changed deployment.
+
+### Environment and deployment boundaries
+
+- All four SSH aliases use user `edgellm`, home `/home/edgellm`, checkout `~/Code/ktransformers`, and conda `~/anaconda3/envs/ktransformers` (Python 3.11.16). Do not install into `bitmoe` or change system JetPack/driver/CUDA.
+- Verified package pins: source-built Torch **2.9.1 / CUDA 12.2**; `ktransformers`, `kt-kernel`, `sglang-kt` **0.7.0.post4**; `sgl-kernel` **0.3.21**; `transformers-kt` **5.6.0.post3**; Triton **3.5.1**; torchvision **0.24.1**; torchaudio **2.9.1**. Native packages were built for the target Jetson ABI. Never copy Orin SM87 binaries to Xavier SM72, or workstation x86 build outputs to either.
+- Communication uses the local opt-in **`SGLANG_JETSON_SINGLE_GPU_GLOO=1`**, restricted to world size 1; model computation remains on CUDA. On AGX, NCCL compiled but failed the Jetson NVML P2P runtime query. On edges, NCCL is not compiled. Neither is a validated NCCL serving configuration. **`USE_LIBUV=0`** selects the classic TCPStore required by these Torch builds.
+- Keep **`SGLANG_APPLY_CONFIG_BACKUP=none`** and the environment's **`PIP_CONSTRAINT`**. Installing vanilla `transformers` would overwrite the KT fork's namespace; unpinned dependency upgrades can replace the native Torch stack. The installed constraints and metadata-adjusted dependency wheels are recorded in each repair directory.
+- HF checkpoints belong under `~/models/`; GGUF weights under `~/gguf/<ModelName>/`. The edge Llama-1B HF directory was exported from the existing GGUF. Do **not** substitute edge1's incomplete `~/models/Llama-3.1-8B-Instruct` directory.
+- These commands target the **already provisioned devices**, not a clean upstream checkout. On the inventory date, all four deployed branches were `tzj/bitmoe` at `440df94` with local compatibility patches, including changes inside `third_party/sglang` (pinned base `3424f35`). The control checkout has newer commits. Preserve and reconcile remote patches before updating; do not `reset --hard`, force-update submodules, or overwrite remote trees with workstation binaries.
+- `.omx/setup-agx/` and `.omx/setup-edge/` contain **ignored, device-local** launchers, wheels/patch manifests, environment snapshots and test evidence. They are not included by `git clone` or by this documentation commit. Recover the corresponding device artifacts before using these instructions on a fresh installation; the upstream SM75 policy has not been globally disabled for Xavier.
+
+### Start the existing validated dense profiles
+
+From the control machine, choose one command (foreground; Ctrl-C to stop your server):
+
+```bash
+ssh agx 'bash ~/Code/ktransformers/.omx/setup-agx/inference-repair-20260912/serve-llama.sh'
+ssh edge1 'bash ~/Code/ktransformers/.omx/setup-edge/serve-llama.sh'
+ssh edge2 'bash ~/Code/ktransformers/.omx/setup-edge/serve-llama.sh'
+ssh edge3 'bash ~/Code/ktransformers/.omx/setup-edge/serve-llama.sh'
+```
+
+Each launcher activates the correct environment and binds **`127.0.0.1:30124`**. Check that the port is unused; do not stop someone else's service. For client access from the control machine, use a separate tunnel such as `ssh -N -L 30124:127.0.0.1:30124 edge1` with a free local port, rather than exposing the server on `0.0.0.0`.
+
+The equivalent commands below explain the required settings. Run them **on the selected device in a clean Bash shell**, not on the control machine. First activate the shared environment:
+
+```bash
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate ktransformers
+cd ~/Code/ktransformers
+export CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
+export PYTHONNOUSERSITE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export SGLANG_APPLY_CONFIG_BACKUP=none SGLANG_JETSON_SINGLE_GPU_GLOO=1 USE_LIBUV=0
+```
+
+**AGX Orin only:** conda activation selects the system CUDA 12.2 runtime. Use the existing complete Llama-8B checkpoint and Triton attention:
+
+```bash
+export TRITON_PTXAS_PATH=/usr/local/cuda-12.2/bin/ptxas
+kt run "$HOME/models/Llama-3.1-8B-Instruct" \
+  --weights-path "$HOME/gguf/Llama-3.1-8B-Instruct/Llama-3.1-8B-Instruct-F16.gguf" \
+  --kt-method LLAMAFILE --host 127.0.0.1 --port 30124 \
+  --served-model-name agx-kt-smoke-20260912 \
+  --tensor-parallel-size 1 --gpu-experts 0 --cpu-threads 4 --numa-nodes 1 \
+  --attention-backend triton --dtype half \
+  --max-total-tokens 512 --max-running-requests 1 --chunked-prefill-size 64 \
+  --mem-fraction-static 0.55 --context-length 1024 \
+  --disable-cuda-graph --disable-overlap-schedule --disable-custom-all-reduce \
+  --random-seed 42 --skip-server-warmup
+```
+
+**edge1 / edge2 / edge3 Xavier only:** source the private runtime helper after conda activation. It sets `CUDA_HOME=~/opt/ktransformers-cuda-12.2/root/usr/local/cuda-12.2`, puts its `compat/` and `lib64/` ahead of system libraries, and retains the JetPack CUDA 11.4/cuDNN/Tegra library paths. Do not replace the system driver or change global CUDA symlinks.
+
+```bash
+source .omx/setup-edge/runtime-env.sh
+export SGLANG_JETSON_SM72_DENSE=1
+export NVCC_PREPEND_FLAGS="--compiler-bindir=$CONDA_PREFIX/bin/aarch64-conda-linux-gnu-g++"
+export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
+export TVM_FFI_CACHE_DIR="$HOME/.cache/ktransformers-sm72-gcc11-20260913/tvm-ffi"
+kt run "$HOME/models/Llama-3.2-1B-Instruct-from-GGUF" \
+  --weights-path "$HOME/gguf/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-f16.gguf" \
+  --kt-method LLAMAFILE --host 127.0.0.1 --port 30124 \
+  --served-model-name xavier-kt-smoke-20260913 \
+  --tensor-parallel-size 1 --gpu-experts 0 --cpu-threads 4 --numa-nodes 1 \
+  --attention-backend torch_native --sampling-backend pytorch --dtype half \
+  --max-total-tokens 256 --max-running-requests 1 --chunked-prefill-size 64 \
+  --mem-fraction-static 0.40 --context-length 1024 \
+  --disable-cuda-graph --disable-overlap-schedule --disable-custom-all-reduce \
+  --random-seed 42 --skip-server-warmup
+```
+
+The explicit conda **GCC 11.4** selection is necessary for SGLang's C++20 CUDA JIT; the edges' system GCC 9 fails on `<concepts>`. `CXX` alone did not select NVCC's host compiler. The SM72 dense mode is deliberately restricted to single-GPU, unquantized FP16 Llama, `torch_native` CUDA attention and PyTorch sampling; a basic Triton probe passing does not establish general Triton attention support on Xavier.
+
+### Smoke and acceptance evidence
+
+In another terminal on that device (or through the SSH tunnel), wait for the expected model ID in `/v1/models`, then submit an actual generation request:
+
+```bash
+curl -fsS --max-time 10 http://127.0.0.1:30124/v1/models
+MODEL=xavier-kt-smoke-20260913  # On AGX: MODEL=agx-kt-smoke-20260912
+curl -fsS --max-time 180 http://127.0.0.1:30124/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Answer in one short sentence: What is the capital of France?\"}],\"temperature\":0,\"max_tokens\":32,\"stream\":false}"
+```
+
+Require a nonempty answer containing **Paris**; repeat with `Answer briefly: What is two plus three?` and require **5/five**. Imports, `/v1/models`, a ready log, or an isolated native MoE test are not end-to-end inference acceptance. The first request may include tens of seconds of JIT compilation; do not report that as steady-state throughput. Stop only the server/process group you started, and verify its children and port are gone; parent exit alone is insufficient.
+
+Saved successful evidence (paths relative to the corresponding device checkout):
+
+- AGX: `.omx/setup-agx/inference-repair-20260912/final-validation.json` and `generation-attempt2/result.json` in that directory. Actual answers: `The capital of France is Paris.` and `5.`.
+- Each edge: `.omx/setup-edge/inference-repair-20260913/final-validation.json` and `generation-sm72-native2/`. Actual answers: `Paris is the capital of France.` and `Two plus three equals five.`. The control checkout also retains `fleet-final-validation.json` under the same repair directory.
+- Each repair directory retains `serve-llama.sh` or launcher-validation evidence, the generation driver, `environment-final.yml`, dependency snapshots and native/source hashes. Use a **fresh attempt directory** for retesting. After source or binary changes, rerun the relevant native/serving gates; do not edit old readiness hashes to make stale evidence pass.
+- The moved WorkerPool regression is now local-only at `.omx/setup-edge/regression-tests/test_worker_pool_config.py`; older remote gates still reference their original test path. If deploying updated validation helpers, also deploy the matching test and regenerate gates by actually running them. Do not mix new helpers with old hash markers.
+
+### DeepSeek-V2-Lite SSD-backed experts: not working yet
+
+Do not present the dense results above as DeepSeek success. As of this inventory:
+
+- All three edges have the previously SHA256/tensor-index-verified HF checkpoint at **`~/models/DeepSeek-V2-Lite`** (4 safetensors shards; 31,418,836,616 bytes across the copied files). Copy evidence is in `.omx/setup-edge/deepseek-v2-lite-copy-20260913/` on the control machine.
+- **Only edge1** has `~/gguf/DeepSeek-V2-Lite/DeepSeek-V2-Lite-Experts-F16.gguf`: **28,789,709,120 bytes**, SHA256 `d25bd3ae5f00268696305726b936dbea5ee3753c0f9ddc18919266b448c0bb2c`. This is expert-only F16 GGUF; tokenizer, attention, shared and other non-expert weights still come from HF. Edge2/3 do not have this GGUF or a tested DeepSeek serving profile.
+- Edge1's 2026-09-14 attempt loaded the model and verified **78 native expert pointers aliasing the SSD GGUF**, then aborted on the first generation in ARM F16 expert matvec: **`std::runtime_error: llamafile not supported` / SIGABRT**. A CPU-only H2048/I1408 reproduction also failed. **Zero completed text responses; no F16 fix applied yet.** Native FP32 MoE and GPU attention/router numerical passes do not resolve this failure.
+- The experimental launcher and logs are under `.omx/setup-edge/deepseek-ssd-inference-20260914/` on edge1 and the control machine. `serve-deepseek.sh` targets localhost **30125**, but it is a **debugging profile, not a working inference command**. It requires the separate guarded `SGLANG_JETSON_SM72_DEEPSEEK=1` path, Triton MLA tile changes, and `SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch` for correct GPU FP32 router accumulation with FP16 inputs. Do not substitute the dense SM72 flag or roll it out as a validated edge2/3 configuration.
+- KT has **no independent SSD expert pager/LRU**. The intended path is **LLAMAFILE + GGUF mmap + one threadpool**, with zero GPU routed experts and GPU expert prefill disabled. Linux manages file-backed page cache; NativeMoE BF16 copies experts into anonymous DRAM and is not equivalent. No bounded-cache or memory-capped DeepSeek throughput result has passed on these devices. Jetson memory cgroups were v1/hybrid, so the separate workstation cgroup-v2 recipe below is not directly applicable.
+
+Next acceptance order remains: fix and numerically test ARM F16 single-/multi-token expert execution while preserving mmap, obtain real edge1 generation, then deploy and independently verify edge2 and edge3.
+
+### Repair / rebuild precautions
+
+1. Preserve the tested core backups: `ktransformers-core-backup-20260912` on AGX; `ktransformers-core-backup-20260913` on edges. These are **core-only rollback environments**, not replacement serving environments. Never rerun the older core-only Torch build script over the serving environment: it disables distributed support required by SGLang.
+2. Start from each device's `inference-repair-20260912/` (AGX) or `inference-repair-20260913/` (edge) scripts, source pins, constraints and wheel manifests. Rebuild Torch/native extensions for the actual SM and ABI; share wheels between edges only after ABI/hash checks and numerical tests on the recipient. Preserve failed attempts and source patches rather than repeatedly reinstalling arbitrary packages.
+3. Xavier's NUMA-disabled kernel needs the WorkerPool logical-node-0 / hwloc allowed-CPU-set fallback (`b71c2bc` in this branch). The LLAMAFILE single-partition QK_K guard fix is `a7cda38`. Device SGLang patches additionally handle guarded Gloo, native architecture exclusions, and on Xavier the real CUDA memory query when `nvidia-smi` is absent. A missing `nvidia-smi` executable or an x86-centric `kt doctor` label is not proof that CUDA is unusable; use actual device/ELF and numerical checks, never fake command output.
+4. Validate real CPU/CUDA Gloo rendezvous, core CUDA/cuDNN/native kernels, `python -m pip check`, then actual generated text for the selected model/profile. Preserve default architecture restrictions and explicit errors for unsupported kernels. Do not infer BF16/FP8/FP4, SFT, all-model or multi-host support from the FP16 dense smoke.
+
 ## Local mmap / cgroup memory-gradient testing
+
+This is a separate workstation experiment, **not** the Jetson operating procedure above. Its absolute paths, GPU UUID and cgroup-v2 settings must not be copied to the Jetsons unchanged.
 
 This is the procedure used on this host to measure DeepSeek-V2-Lite with **GPU non-expert / CPU routed-expert** and Linux mmap page cache under a shrinking cgroup memory cap. Scripts and completed runs live outside the repo:
 
@@ -61,7 +188,7 @@ Always set `SGLANG_APPLY_CONFIG_BACKUP=none`. Otherwise SGLang maps 27-layer V2 
 
 LLAMAFILE refuses `intermediate_size` not divisible by `QK_K=256`. That check is only valid when **slicing** FFN across TP partitions. DeepSeek-V2-Lite has I=1408; with `--kt-threadpool-count 1` the partition owns the full width and aliases mmap.
 
-Keep this uncommitted working-tree change (do not revert it if you still need to launch LLAMAFILE on this model):
+This branch includes the single-partition guard fix (`a7cda38`); preserve it when updating or deploying:
 
 - `kt-kernel/operators/moe-tp.hpp`: `if (is_llamafile && tp_count > 1)` before the `% QK_K` throw
 - `kt-kernel/python/utils/llamafile.py`: raise only when `threadpool_count > 1`
@@ -201,7 +328,7 @@ Completed 8-way results (do not overwrite): `native-h{48,16,8,4}/` and `pretouch
 
 ### Explicitly out of scope for this bench
 
-- Committing probes, QK_K enablement, or `/tmp` scripts into the repo unless the owner asks
+- Committing additional probes or `/tmp` scripts into the repo unless the owner asks
 - Rebuilding or re-running GPU cases as a drive-by after doc-only edits
 - Changing BitMoE pins or conda env `bitmoe`
 - Using NativeMoE as a stand-in for mmap (it copies experts into anon DRAM)
