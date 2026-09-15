@@ -22,6 +22,29 @@
 
 #include "hwloc.h"
 
+namespace {
+
+// A UMA host has no HWLOC_OBJ_NUMANODE.  Its allowed CPU set is the correct
+// affinity domain for logical node 0.
+hwloc_const_cpuset_t numa_or_allowed_cpuset(hwloc_topology_t topology, int numa_id) {
+  if (numa_binding_available()) {
+    if (numa_id < 0 || numa_id >= numa_num_configured_nodes()) {
+      return nullptr;
+    }
+    hwloc_obj_t numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
+    return numa_obj ? numa_obj->cpuset : hwloc_topology_get_allowed_cpuset(topology);
+  }
+  return numa_id == 0 ? hwloc_topology_get_allowed_cpuset(topology) : nullptr;
+}
+
+void validate_numa_id(int numa_id) {
+  if (numa_id < 0 || numa_id >= logical_numa_node_count()) {
+    throw std::invalid_argument("NUMA id is outside the available logical NUMA nodes");
+  }
+}
+
+}  // namespace
+
 thread_local int WorkerPool::thread_local_id = -1;
 
 InNumaPool::InNumaPool(int max_thread_num) {
@@ -41,7 +64,7 @@ InNumaPool::InNumaPool(int max_thread_num) {
 InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
   printf("===========In NumaPool============\n");
   hwloc_topology_t topology;
-  hwloc_obj_t numa_obj, core_obj;
+  hwloc_obj_t core_obj;
   hwloc_bitmap_t cpuset;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
@@ -71,13 +94,12 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // printf("Failed to set thread name: %s\n", name);
     }
     // Set the thread affinity to the specified NUMA node's CPU
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
-    if (!numa_obj) {
+    auto numa_cpuset = numa_or_allowed_cpuset(topology, numa_id);
+    if (!numa_cpuset) {
       fprintf(stderr, "NUMA node %d not found\n", numa_id);
-      // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
     if (!core_obj) {
       fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
       // throw std::runtime_error("Core not found inside NUMA node");
@@ -249,6 +271,12 @@ NumaJobDistributor::NumaJobDistributor(std::vector<int> numa_ids, std::vector<in
 }
 
 void NumaJobDistributor::init(std::vector<int> numa_ids) {
+  if (numa_ids.empty()) {
+    throw std::invalid_argument("NumaJobDistributor requires at least one logical NUMA node");
+  }
+  for (int numa_id : numa_ids) {
+    validate_numa_id(numa_id);
+  }
   this->numa_count = numa_ids.size();
   this->ready_bar = std::unique_ptr<std::barrier<>>(new std::barrier<>(numa_count + 1));
   this->numa_ids = numa_ids;
@@ -266,8 +294,17 @@ void NumaJobDistributor::init(std::vector<int> numa_ids) {
 }
 
 void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread_count) {
+  if (numa_ids.empty() || thread_count.size() != numa_ids.size()) {
+    throw std::invalid_argument("NumaJobDistributor NUMA ids and thread counts must be non-empty and aligned");
+  }
+  for (size_t i = 0; i < numa_ids.size(); ++i) {
+    validate_numa_id(numa_ids[i]);
+    if (thread_count[i] <= 0) {
+      throw std::invalid_argument("NumaJobDistributor thread counts must be positive");
+    }
+  }
   hwloc_topology_t topology;
-  hwloc_obj_t numa_obj, core_obj;
+  hwloc_obj_t core_obj;
   hwloc_bitmap_t cpuset;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
@@ -282,7 +319,7 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
   }
 
   workers.resize(numa_count);
-  std::vector<int> numa_threads_count(numa_count, 0);
+  std::vector<int> numa_threads_count(logical_numa_node_count(), 0);
   for (int i = 0; i < numa_count; i++) {
     workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
     auto this_numa = numa_ids[i];
@@ -293,13 +330,12 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
     pthread_t native_handle = workers[i].native_handle();
     pthread_setname_np(native_handle, thread_name.c_str());
     // Set the thread affinity to the specified NUMA node's CPU (0)
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
-    if (!numa_obj) {
+    auto numa_cpuset = numa_or_allowed_cpuset(topology, this_numa);
+    if (!numa_cpuset) {
       fprintf(stderr, "NUMA node %d not found\n", this_numa);
-      // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, start_id);
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_cpuset, HWLOC_OBJ_CORE, start_id);
     if (!core_obj) {
       fprintf(stderr, "Core %d inside NUMA node %d not found\n", 0, this_numa);
       // throw std::runtime_error("Core not found inside NUMA node");
@@ -401,9 +437,8 @@ void NumaJobDistributor::worker_thread(int numa_id) {
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
       if (duration > 50) {
         std::unique_lock<std::mutex> lock(*mutexes[numa_id]);
-        cvs[numa_id]->wait(lock, [&] {
-          return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING;
-        });
+        cvs[numa_id]->wait(lock,
+                           [&] { return status[numa_id]->load(std::memory_order_acquire) != ThreadStatus::WAITING; });
       }
     } else if (stat == ThreadStatus::EXIT) {
       return;
@@ -412,6 +447,16 @@ void NumaJobDistributor::worker_thread(int numa_id) {
 }
 
 void WorkerPool::init(WorkerPoolConfig config) {
+  if (config.subpool_count <= 0 || config.subpool_numa_map.size() != static_cast<size_t>(config.subpool_count) ||
+      config.subpool_thread_count.size() != static_cast<size_t>(config.subpool_count)) {
+    throw std::invalid_argument("WorkerPoolConfig must contain one NUMA id and thread count per subpool");
+  }
+  for (int i = 0; i < config.subpool_count; ++i) {
+    validate_numa_id(config.subpool_numa_map[i]);
+    if (config.subpool_thread_count[i] <= 0) {
+      throw std::invalid_argument("WorkerPoolConfig thread counts must be positive");
+    }
+  }
   printf("WorkerPool[0x%lx] %d subpools, [numa:threads]", (intptr_t)this, config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
     printf("[%d:%d] ", config.subpool_numa_map[i], config.subpool_thread_count[i]);
@@ -421,7 +466,7 @@ void WorkerPool::init(WorkerPoolConfig config) {
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);
   }
-  std::vector<int> numa_threads_count(config.subpool_count, 0);
+  std::vector<int> numa_threads_count(logical_numa_node_count(), 0);
   for (int i = 0; i < config.subpool_count; i++) {
     auto this_numa = config.subpool_numa_map[i];
     auto this_thread_count = config.subpool_thread_count[i];
@@ -443,7 +488,7 @@ void WorkerPool::init(WorkerPoolConfig config) {
 WorkerPool::WorkerPool(WorkerPoolConfig config) : config(config) { init(config); }
 
 WorkerPool::WorkerPool(int total_threads) {
-  config.subpool_count = numa_num_configured_nodes();
+  config.subpool_count = logical_numa_node_count();
   config.subpool_numa_map.resize(config.subpool_count);
   config.subpool_thread_count.resize(config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
@@ -454,8 +499,9 @@ WorkerPool::WorkerPool(int total_threads) {
 }
 
 WorkerPool::WorkerPool(int total_threads, int single_numa_id) {
+  validate_numa_id(single_numa_id);
   set_to_numa(single_numa_id);
-  config.subpool_count = numa_num_configured_nodes();
+  config.subpool_count = logical_numa_node_count();
   config.subpool_numa_map.resize(config.subpool_count);
   config.subpool_thread_count.resize(config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {

@@ -23,10 +23,22 @@
 #include <thread>
 #include <vector>
 
+// libnuma reports zero configured nodes on UMA-only hosts (notably Jetson).
+// Treat those machines as a single logical node, but do not attempt a NUMA bind.
+inline bool numa_binding_available() { return numa_available() >= 0 && numa_num_configured_nodes() > 0; }
+
+inline int logical_numa_node_count() { return numa_binding_available() ? numa_num_configured_nodes() : 1; }
+
 // #define PROFILE_BALANCE
 
 inline void set_to_numa(int this_numa) {
+  if (!numa_binding_available() || this_numa < 0 || this_numa >= numa_num_configured_nodes()) {
+    return;
+  }
   struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
+  if (!mask) {
+    return;
+  }
   numa_bitmask_setbit(mask, this_numa);
   numa_bind(mask);
   numa_bitmask_free(mask);
@@ -34,6 +46,9 @@ inline void set_to_numa(int this_numa) {
 
 inline void set_memory_to_numa(int this_numa) {
   // printf("Set memory to NUMA %d\n", this_numa);
+  if (!numa_binding_available()) {
+    return;
+  }
   hwloc_topology_t topology;
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
